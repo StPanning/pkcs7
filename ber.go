@@ -3,6 +3,8 @@ package pkcs7
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"reflect"
 )
 
 var encodeIndent = 0
@@ -61,7 +63,7 @@ func ber2der(ber []byte) ([]byte, error) {
 	//fmt.Printf("--> ber2der: Transcoding %d bytes\n", len(ber))
 	out := new(bytes.Buffer)
 
-	obj, _, err := readObject(ber, 0)
+	obj, _, err := readObject(ber, 0, 0x00)
 	if err != nil {
 		return nil, err
 	}
@@ -132,10 +134,73 @@ func encodeLength(out *bytes.Buffer, length int) (err error) {
 	return
 }
 
-func readObject(ber []byte, offset int) (asn1Object, int, error) {
-	//fmt.Printf("\n====> Starting readObject at offset: %d\n\n", offset)
+func inArray(elem byte, arr []byte) bool {
+	for _, arr_elem := range arr {
+		if arr_elem == elem {
+			return true
+		}
+	}
+	return false
+}
+
+func combineConstructedStr(subObjects []asn1Object, strTag byte) (asn1Object, error) {
+	// fmt.Printf("--> chunky stuff %x\n", strTag)
+	var err error
+	var chunks []byte
+	for i := 0; i < len(subObjects); i++ {
+		var child asn1Primitive = subObjects[i].(asn1Primitive)
+		chunks = append(chunks, child.content...)
+	}
+	asn1Chunk := asn1Primitive{
+		tagBytes: []byte{strTag},
+		length:   len(chunks),
+		content:  chunks,
+	}
+	var chunkedObj asn1Object
+	iout := new(bytes.Buffer)
+	asn1Chunk.EncodeTo(iout)
+	//fmt.Printf("--> building bundle out of %d bytes\n", len(bundle))
+	chunkedObj, _, err = readObject(iout.Bytes(), 0, 0x00)
+	if err != nil {
+		return nil, err
+	}
+	return chunkedObj, nil
+}
+
+func isConstructedString(tag byte) bool {
+	var constuctedStrTags = []byte{0x23, // bit string
+		0x24, // octet string
+		0x33, // PrintableString
+		0x34, // T61String
+		0x36, // IA5String
+
+	}
+	if inArray(tag, constuctedStrTags) {
+		return true
+	}
+	return false
+}
+
+func genSubObjects(subObjects []asn1Object, primitiveType byte) ([]asn1Object, error) {
+	fmt.Printf("IN ARRAY\n")
+	var chunkedObj asn1Object
+	var err error
+	chunkedObj, err = combineConstructedStr(subObjects, primitiveType)
+	if err != nil {
+		return nil, err
+	}
+	subObjects = nil
+	subObjects = append(subObjects, chunkedObj)
+	return subObjects, nil
+}
+
+func readObject(ber []byte, offset int, parent_tag byte) (asn1Object, int, error) {
+	//	fmt.Printf("\n====> Starting readObject at offset: %d\n\n", offset)
+	//var constuctedStrTags = []interface{}{0x24}
 	tagStart := offset
-	b := ber[offset]
+	var b byte
+	b = ber[offset]
+	fmt.Printf("readObject typeof B %s\n", reflect.TypeOf(b))
 	offset++
 	tag := b & 0x1F // last 5 bits
 	if tag == 0x1F {
@@ -150,6 +215,9 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 	tagEnd := offset
 
 	kind := b & 0x20
+	primitiveType := b - 0x20
+	// fmt.Printf("primitive T: %x, kind: %x, b: %x", primitiveType, kind, b)
+
 	/*
 		if kind == 0 {
 			fmt.Print("--> Primitive\n")
@@ -161,7 +229,7 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 	var length int
 	l := ber[offset]
 	offset++
-	hack := 0
+	indefinite := false
 	if l > 0x80 {
 		numberOfBytes := (int)(l & 0x7F)
 		if numberOfBytes > 4 { // int is only guaranteed to be 32bit
@@ -180,14 +248,7 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 			offset++
 		}
 	} else if l == 0x80 {
-		// find length by searching content
-		markerIndex := bytes.LastIndex(ber[offset:], []byte{0x0, 0x0})
-		if markerIndex == -1 {
-			return nil, 0, errors.New("ber2der: Invalid BER format")
-		}
-		length = markerIndex
-		hack = 2
-		//fmt.Printf("--> (compute length) marker found at offset: %d\n", markerIndex+offset)
+		indefinite = true
 	} else {
 		length = (int)(l)
 	}
@@ -201,7 +262,12 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 	//fmt.Printf("--> content end   : %d\n", contentEnd)
 	//fmt.Printf("--> content       : % X\n", ber[offset:contentEnd])
 	var obj asn1Object
-	if kind == 0 {
+	if indefinite && kind == 0 {
+		return nil, 0, errors.New("ber2der: Indefinite form tag must have constructed encoding")
+	}
+
+	if kind == 0 || parent_tag == 0x24 {
+		//fmt.Printf("--> returning primitive with parent_tag: %d\n", parent_tag)
 		obj = asn1Primitive{
 			tagBytes: ber[tagStart:tagEnd],
 			length:   length,
@@ -209,14 +275,42 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 		}
 	} else {
 		var subObjects []asn1Object
-		for offset < contentEnd {
+		for (offset < contentEnd) || indefinite {
 			var subObj asn1Object
 			var err error
-			subObj, offset, err = readObject(ber[:contentEnd], offset)
+			subObj, offset, err = readObject(ber, offset, b)
 			if err != nil {
 				return nil, 0, err
 			}
 			subObjects = append(subObjects, subObj)
+			//		var strTag byte
+			if indefinite {
+				terminated, err := isIndefiniteTermination(ber, offset)
+				if err != nil {
+					return nil, 0, err
+				}
+
+				if terminated {
+					if isConstructedString(b) {
+						subObjects, err = genSubObjects(
+							subObjects,
+							primitiveType)
+						if err != nil {
+							return nil, 0, err
+						}
+					}
+					break
+				}
+			} else {
+				if isConstructedString(b) {
+					subObjects, err = genSubObjects(
+						subObjects,
+						primitiveType)
+					if err != nil {
+						return nil, 0, err
+					}
+				}
+			}
 		}
 		obj = asn1Structured{
 			tagBytes: ber[tagStart:tagEnd],
@@ -224,5 +318,18 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 		}
 	}
 
-	return obj, contentEnd + hack, nil
+	// Apply indefinite form length with 0x0000 terminator.
+	if indefinite {
+		contentEnd = offset + 2
+	}
+
+	return obj, contentEnd, nil
+}
+
+func isIndefiniteTermination(ber []byte, offset int) (bool, error) {
+	if len(ber)-offset < 2 {
+		return false, errors.New("ber2der: Invalid BER format")
+	}
+
+	return bytes.Index(ber[offset:], []byte{0x0, 0x0}) == 0, nil
 }
