@@ -19,7 +19,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/fullsailor/pkcs7/internal/x509util"
+	"github.com/StPanning/pkcs7/internal/x509util"
 
 	_ "crypto/sha1"   // for crypto.SHA1
 	_ "crypto/sha256" // for crypto.SHA256
